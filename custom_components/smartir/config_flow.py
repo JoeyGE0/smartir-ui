@@ -47,13 +47,14 @@ from .const import (
     DEFAULT_DELAY,
     DEFAULT_DEVICE_CLASS,
     DOMAIN,
+    MIN_DELAY,
     PLATFORM_CLIMATE,
     PLATFORM_DEFAULT_NAMES,
     PLATFORM_FAN,
     PLATFORM_LIGHT,
     PLATFORM_MEDIA_PLAYER,
 )
-from .helpers import async_load_device_data, build_unique_id
+from .helpers import async_load_device_data, build_unique_id, normalize_delay
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,6 +74,25 @@ PLATFORM_OPTIONS = [
 ]
 
 
+def _optional_entity(
+    key: str, config: EntitySelectorConfig, defaults: dict[str, Any]
+) -> dict:
+    """Return optional entity selector without invalid None default."""
+    value = defaults.get(key)
+    if value:
+        return {vol.Optional(key, default=value): EntitySelector(config)}
+    return {vol.Optional(key): EntitySelector(config)}
+
+
+def _required_entity(
+    key: str, config: EntitySelectorConfig, default: str | None
+) -> dict:
+    """Return required entity selector without invalid None default."""
+    if default:
+        return {vol.Required(key, default=default): EntitySelector(config)}
+    return {vol.Required(key): EntitySelector(config)}
+
+
 def _controller_fields(defaults: dict[str, Any]) -> dict:
     """Return shared controller configuration fields."""
     controller_type = defaults.get(CONF_CONTROLLER_TYPE, CONTROLLER_REMOTE)
@@ -85,16 +105,26 @@ def _controller_fields(defaults: dict[str, Any]) -> dict:
     }
 
     if controller_type == CONTROLLER_REMOTE:
-        fields[vol.Required(
-            CONF_CONTROLLER_ENTITY,
-            default=defaults.get(CONF_CONTROLLER_ENTITY)
-            or defaults.get(CONF_CONTROLLER_DATA),
-        )] = EntitySelector(EntitySelectorConfig(domain="remote"))
+        controller_default = (
+            defaults.get(CONF_CONTROLLER_ENTITY) or defaults.get(CONF_CONTROLLER_DATA)
+        )
+        fields.update(
+            _required_entity(
+                CONF_CONTROLLER_ENTITY,
+                EntitySelectorConfig(domain="remote"),
+                controller_default,
+            )
+        )
     else:
-        fields[vol.Required(
-            CONF_CONTROLLER_DATA,
-            default=defaults.get(CONF_CONTROLLER_DATA),
-        )] = TextSelector(TextSelectorConfig(type=selector.TextSelectorType.TEXT))
+        controller_data = defaults.get(CONF_CONTROLLER_DATA)
+        if controller_data:
+            fields[vol.Required(CONF_CONTROLLER_DATA, default=controller_data)] = (
+                TextSelector(TextSelectorConfig(type=selector.TextSelectorType.TEXT))
+            )
+        else:
+            fields[vol.Required(CONF_CONTROLLER_DATA)] = TextSelector(
+                TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+            )
 
     return fields
 
@@ -104,20 +134,28 @@ def _base_schema(platform: str, defaults: dict[str, Any] | None = None) -> vol.S
     defaults = defaults or {}
     default_name = defaults.get(CONF_NAME, PLATFORM_DEFAULT_NAMES[platform])
 
+    device_code = defaults.get(CONF_DEVICE_CODE)
+    if device_code is not None:
+        device_code_field = vol.Required(CONF_DEVICE_CODE, default=str(device_code))
+    else:
+        device_code_field = vol.Required(CONF_DEVICE_CODE)
+
     fields = {
         vol.Required(CONF_NAME, default=default_name): str,
-        vol.Required(
-            CONF_DEVICE_CODE, default=defaults.get(CONF_DEVICE_CODE)
-        ): NumberSelector(
-            NumberSelectorConfig(min=1, max=99999, mode=NumberSelectorMode.BOX)
-        ),
+        device_code_field: str,
         vol.Optional(CONF_DELAY, default=defaults.get(CONF_DELAY, DEFAULT_DELAY)): NumberSelector(
-            NumberSelectorConfig(min=0, max=10, step=0.1, mode=NumberSelectorMode.BOX)
+            NumberSelectorConfig(
+                min=MIN_DELAY, max=10, step=0.1, mode=NumberSelectorMode.BOX
+            )
         ),
-        vol.Optional(
-            CONF_POWER_SENSOR, default=defaults.get(CONF_POWER_SENSOR)
-        ): EntitySelector(EntitySelectorConfig(domain=["binary_sensor", "sensor"])),
     }
+    fields.update(
+        _optional_entity(
+            CONF_POWER_SENSOR,
+            EntitySelectorConfig(domain=["binary_sensor", "sensor"]),
+            defaults,
+        )
+    )
     fields.update(_controller_fields(defaults))
     return vol.Schema(fields)
 
@@ -126,25 +164,23 @@ def _climate_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     defaults = defaults or {}
     fields = _base_schema(PLATFORM_CLIMATE, defaults).schema.copy()
     fields.update(
-        {
-            vol.Optional(
-                CONF_TEMPERATURE_SENSOR,
-                default=defaults.get(CONF_TEMPERATURE_SENSOR),
-            ): EntitySelector(
-                EntitySelectorConfig(domain="sensor", device_class="temperature")
-            ),
-            vol.Optional(
-                CONF_HUMIDITY_SENSOR,
-                default=defaults.get(CONF_HUMIDITY_SENSOR),
-            ): EntitySelector(
-                EntitySelectorConfig(domain="sensor", device_class="humidity")
-            ),
-            vol.Optional(
-                CONF_POWER_SENSOR_RESTORE_STATE,
-                default=defaults.get(CONF_POWER_SENSOR_RESTORE_STATE, False),
-            ): bool,
-        }
+        _optional_entity(
+            CONF_TEMPERATURE_SENSOR,
+            EntitySelectorConfig(domain="sensor", device_class="temperature"),
+            defaults,
+        )
     )
+    fields.update(
+        _optional_entity(
+            CONF_HUMIDITY_SENSOR,
+            EntitySelectorConfig(domain="sensor", device_class="humidity"),
+            defaults,
+        )
+    )
+    fields[vol.Optional(
+        CONF_POWER_SENSOR_RESTORE_STATE,
+        default=defaults.get(CONF_POWER_SENSOR_RESTORE_STATE, False),
+    )] = bool
     return vol.Schema(fields)
 
 
@@ -188,24 +224,42 @@ def _resolve_controller_from_input(user_input: dict[str, Any]) -> str:
     return user_input[CONF_CONTROLLER_DATA]
 
 
-def _entry_data(platform: str, user_input: dict[str, Any]) -> dict[str, Any]:
+def _clean_optional_entities(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove empty optional entity fields."""
+    entity_keys = (
+        CONF_POWER_SENSOR,
+        CONF_TEMPERATURE_SENSOR,
+        CONF_HUMIDITY_SENSOR,
+        CONF_CONTROLLER_ENTITY,
+    )
+    for key in entity_keys:
+        if not data.get(key):
+            data.pop(key, None)
+    return data
+
+
+def _entry_data(platform: str, user_input: dict[str, Any], device_code: int) -> dict[str, Any]:
     controller = _resolve_controller_from_input(user_input)
     data: dict[str, Any] = {
         CONF_PLATFORM: platform,
         CONF_NAME: user_input[CONF_NAME],
-        CONF_DEVICE_CODE: int(user_input[CONF_DEVICE_CODE]),
+        CONF_DEVICE_CODE: device_code,
         CONF_CONTROLLER_TYPE: user_input[CONF_CONTROLLER_TYPE],
         CONF_CONTROLLER_DATA: controller,
-        CONF_DELAY: float(user_input.get(CONF_DELAY, DEFAULT_DELAY)),
-        CONF_POWER_SENSOR: user_input.get(CONF_POWER_SENSOR),
+        CONF_DELAY: normalize_delay(user_input.get(CONF_DELAY, DEFAULT_DELAY)),
     }
+
+    if user_input.get(CONF_POWER_SENSOR):
+        data[CONF_POWER_SENSOR] = user_input[CONF_POWER_SENSOR]
 
     if user_input[CONF_CONTROLLER_TYPE] == CONTROLLER_REMOTE:
         data[CONF_CONTROLLER_ENTITY] = user_input[CONF_CONTROLLER_ENTITY]
 
     if platform == PLATFORM_CLIMATE:
-        data[CONF_TEMPERATURE_SENSOR] = user_input.get(CONF_TEMPERATURE_SENSOR)
-        data[CONF_HUMIDITY_SENSOR] = user_input.get(CONF_HUMIDITY_SENSOR)
+        if user_input.get(CONF_TEMPERATURE_SENSOR):
+            data[CONF_TEMPERATURE_SENSOR] = user_input[CONF_TEMPERATURE_SENSOR]
+        if user_input.get(CONF_HUMIDITY_SENSOR):
+            data[CONF_HUMIDITY_SENSOR] = user_input[CONF_HUMIDITY_SENSOR]
         data[CONF_POWER_SENSOR_RESTORE_STATE] = user_input.get(
             CONF_POWER_SENSOR_RESTORE_STATE, False
         )
@@ -217,7 +271,7 @@ def _entry_data(platform: str, user_input: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             data[CONF_SOURCE_NAMES] = {}
 
-    return data
+    return _clean_optional_entities(data)
 
 
 class SmartIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -260,21 +314,29 @@ class SmartIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         assert platform is not None
 
         if user_input is not None:
-            device_code = int(user_input[CONF_DEVICE_CODE])
-            controller = _resolve_controller_from_input(user_input)
-
-            device_data = await async_load_device_data(platform, device_code)
-            if device_data is None:
+            try:
+                device_code = int(str(user_input[CONF_DEVICE_CODE]).strip())
+                if device_code < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
                 errors["base"] = "invalid_device_code"
-            else:
-                unique_id = build_unique_id(platform, device_code, controller)
-                await self.async_set_unique_id(unique_id)
-                self._abort_if_unique_id_configured()
+                device_code = None
 
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME],
-                    data=_entry_data(platform, user_input),
-                )
+            if device_code is not None:
+                controller = _resolve_controller_from_input(user_input)
+
+                device_data = await async_load_device_data(platform, device_code)
+                if device_data is None:
+                    errors["base"] = "invalid_device_code"
+                else:
+                    unique_id = build_unique_id(platform, device_code, controller)
+                    await self.async_set_unique_id(unique_id)
+                    self._abort_if_unique_id_configured()
+
+                    return self.async_create_entry(
+                        title=user_input[CONF_NAME],
+                        data=_entry_data(platform, user_input, device_code),
+                    )
 
         return self.async_show_form(
             step_id="device",
@@ -295,21 +357,28 @@ class SmartIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class SmartIROptionsFlowHandler(config_entries.OptionsFlow):
     """Handle SmartIR options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self._config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Manage SmartIR options."""
-        platform = self._config_entry.data[CONF_PLATFORM]
-        defaults = {**self._config_entry.data, **self._config_entry.options}
+        platform = self.config_entry.data[CONF_PLATFORM]
+        defaults = {**self.config_entry.data, **self.config_entry.options}
 
         if user_input is not None:
+            try:
+                device_code = int(str(user_input[CONF_DEVICE_CODE]).strip())
+                if device_code < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=_schema_for_platform(platform, defaults),
+                    errors={"base": "invalid_device_code"},
+                )
+
             return self.async_create_entry(
                 title="",
-                data=_entry_data(platform, user_input),
+                data=_entry_data(platform, user_input, device_code),
             )
 
         return self.async_show_form(
